@@ -13,6 +13,7 @@ import threading
 import uuid
 from datetime import datetime
 
+from diff import diff_entries
 from subtitle import validate_track
 
 SCHEMA = """
@@ -138,6 +139,51 @@ class Store:
         ).fetchone()
         number = row["n"] or 0
         return number, (self._snapshot(conn, pid, number) if number else [])
+
+    # ---------- 版本差异 ----------
+
+    def diff(self, from_pid: int, from_number: int, to_pid: int, to_number: int) -> dict:
+        """对比两个版本快照（按稳定 uid）。
+
+        返回 {"status": "ok", ...差异明细...}；
+        版本不存在或属于不同项目时返回 {"status": "error", "error", "message"}，
+        message 为中文原因说明。
+        """
+        with self._connect() as conn:
+            p_from = conn.execute(
+                "SELECT * FROM projects WHERE id = ?", (from_pid,)).fetchone()
+            p_to = conn.execute(
+                "SELECT * FROM projects WHERE id = ?", (to_pid,)).fetchone()
+            if p_from is None:
+                return {"status": "error", "error": "project_not_found",
+                        "message": f"项目 {from_pid} 不存在"}
+            if p_to is None:
+                return {"status": "error", "error": "project_not_found",
+                        "message": f"项目 {to_pid} 不存在"}
+            if from_pid != to_pid:
+                return {"status": "error", "error": "different_projects",
+                        "message": f"所选版本属于不同项目"
+                                   f"（「{p_from['name']}」与「{p_to['name']}」），无法对比"}
+            old = self._snapshot(conn, from_pid, from_number)
+            new = self._snapshot(conn, to_pid, to_number)
+            if old is None:
+                return {"status": "error", "error": "version_not_found",
+                        "message": f"项目「{p_from['name']}」不存在版本 v{from_number}"}
+            if new is None:
+                return {"status": "error", "error": "version_not_found",
+                        "message": f"项目「{p_to['name']}」不存在版本 v{to_number}"}
+        result = diff_entries(old, new)
+        return {
+            "status": "ok",
+            "project": {"id": from_pid, "name": p_from["name"]},
+            "from_version": from_number,
+            "to_version": to_number,
+            "summary": result["summary"],
+            "added": result["added"],
+            "removed": result["removed"],
+            "changed": result["changed"],
+            "reordered": result["reordered"],
+        }
 
     # ---------- 写入 ----------
 

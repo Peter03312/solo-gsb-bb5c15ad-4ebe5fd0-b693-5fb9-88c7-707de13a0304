@@ -29,6 +29,14 @@ def h(s) -> str:
     return html.escape(str(s), quote=True)
 
 
+def _int_param(q, key: str):
+    """从查询串取整数参数；缺失或非法返回 None。"""
+    try:
+        return int(q.get(key, [""])[0])
+    except (TypeError, ValueError):
+        return None
+
+
 CSS = """
 *{box-sizing:border-box}
 body{font-family:-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;color:#222;background:#f6f7f9}
@@ -44,6 +52,9 @@ input.bad{border-color:#d00;background:#ffecec}
 button{cursor:pointer;border:1px solid #bbb;background:#fff;border-radius:4px;padding:5px 10px;margin:2px 0}
 button.primary{background:#2c7be5;border-color:#2c7be5;color:#fff}
 tr.new td{background:#f2fbf2}
+tr.add td{background:#f2fbf2}
+tr.del td{background:#fdeeee}
+tr.reorder td{background:#f4f4f4}
 .muted{color:#888;font-weight:normal}
 .conflicts{border:2px solid #e0a800;background:#fffbe6;padding:12px;margin:12px 0;border-radius:6px}
 .conflict-card{border:1px solid #e0a800;background:#fff;margin:10px 0;padding:10px;border-radius:6px}
@@ -365,8 +376,9 @@ def page_history(pid: int) -> bytes:
     proj = store.get_project(pid)
     if proj is None:
         return layout("未找到", "<h2>项目不存在</h2>")
+    versions = store.list_versions(pid)
     rows = []
-    for v in store.list_versions(pid):
+    for v in versions:
         n = v["number"]
         rows.append(
             f"<tr><td>v{n}</td><td>{h(v['created_at'])}</td><td>{h(v['note'])}</td>"
@@ -375,9 +387,27 @@ def page_history(pid: int) -> bytes:
             f"<a href='/projects/{pid}/export?version={n}&format=srt'>导出 SRT</a> · "
             f"<a href='/projects/{pid}/export?version={n}&format=vtt'>导出 VTT</a></td></tr>"
         )
+    opts_from, opts_to = [], []
+    for i, v in enumerate(versions):  # 按版本号倒序；默认 从=次新、到=最新
+        n = v["number"]
+        label = f"v{n} · {v['created_at']}"
+        opts_from.append(
+            f"<option value='{n}'{' selected' if i == min(1, len(versions) - 1) else ''}>"
+            f"{h(label)}</option>")
+        opts_to.append(
+            f"<option value='{n}'{' selected' if i == 0 else ''}>{h(label)}</option>")
+    compare = ""
+    if versions:
+        compare = f"""
+<form method='get' action='/projects/{pid}/diff'>
+  差异审阅：从 <select name='from'>{''.join(opts_from)}</select>
+  到 <select name='to'>{''.join(opts_to)}</select>
+  <button type='submit' class='primary'>对比所选版本</button>
+</form>"""
     body = f"""
 <h2>{h(proj['name'])} · 历史版本</h2>
 <p><a href='/projects/{pid}'>返回编辑</a> · <a href='/'>返回列表</a></p>
+{compare}
 <table><thead><tr><th>版本</th><th>时间</th><th>说明</th><th>字幕条数</th><th>操作</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>"""
     return layout(f"{proj['name']} · 历史版本", body)
@@ -407,6 +437,76 @@ def page_version(pid: int, number: int) -> bytes:
 <table><thead><tr><th>#</th><th>起点</th><th>终点</th><th>文本</th><th>ID</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>"""
     return layout(f"{proj['name']} · v{number}", body)
+
+
+def page_diff(proj, d: dict) -> bytes:
+    """版本差异审阅页：新增 / 删除 / 内容变化 / 仅顺序变化 分区展示。"""
+    pid = proj["id"]
+    a, b = d["from_version"], d["to_version"]
+    s = d["summary"]
+
+    def side(e) -> str:
+        return (f"<div class='t'>{h(e['start'])} → {h(e['end'])}</div>"
+                f"<div>{h(e['text']).replace(chr(10), '<br>')}</div>")
+
+    sections = []
+    if d["changed"]:
+        rows = []
+        for c in d["changed"]:
+            marks = "、".join(m for m, flag in (("时间变化", c["time_changed"]),
+                                               ("文本变化", c["text_changed"])) if flag)
+            rows.append(
+                f"<tr><td class='muted'>{h(c['uid'])}</td><td>{marks}</td>"
+                f"<td>{side(c['before'])}</td><td>{side(c['after'])}</td></tr>")
+        sections.append(
+            f"<h3>内容变化（{len(d['changed'])} 条）</h3>"
+            "<table><thead><tr><th>ID</th><th>变化</th>"
+            f"<th>v{a}</th><th>v{b}</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>")
+    if d["added"]:
+        rows = [
+            f"<tr class='add'><td class='muted'>{h(e['uid'])}</td>"
+            f"<td>第 {e['new_index']} 条</td><td>{side(e)}</td></tr>"
+            for e in d["added"]
+        ]
+        sections.append(
+            f"<h3>新增（{len(d['added'])} 条，仅存在于 v{b}）</h3>"
+            "<table><thead><tr><th>ID</th><th>位置</th><th>时间与文本</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>")
+    if d["removed"]:
+        rows = [
+            f"<tr class='del'><td class='muted'>{h(e['uid'])}</td>"
+            f"<td>第 {e['old_index']} 条</td><td>{side(e)}</td></tr>"
+            for e in d["removed"]
+        ]
+        sections.append(
+            f"<h3>删除（{len(d['removed'])} 条，仅存在于 v{a}）</h3>"
+            "<table><thead><tr><th>ID</th><th>位置</th><th>时间与文本</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>")
+    if d["reordered"]:
+        rows = [
+            f"<tr class='reorder'><td class='muted'>{h(e['uid'])}</td>"
+            f"<td>第 {e['from_index']} 条 → 第 {e['to_index']} 条</td>"
+            f"<td>{side(e)}</td></tr>"
+            for e in d["reordered"]
+        ]
+        sections.append(
+            f"<h3>仅顺序变化（{len(d['reordered'])} 条，内容未修改，单独标记）</h3>"
+            "<table><thead><tr><th>ID</th><th>位置变化</th><th>时间与文本</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>")
+    if not (d["added"] or d["removed"] or d["changed"] or d["reordered"]):
+        sections.append("<p>两个版本的内容完全一致。</p>")
+    export_url = (f"/api/diff?from_project={pid}&from_version={a}"
+                  f"&to_project={pid}&to_version={b}")
+    body = f"""
+<h2>{h(proj['name'])} · 版本差异 v{a} → v{b}</h2>
+<p>新增 {s['added']} · 删除 {s['removed']} · 内容变化 {s['changed']} ·
+仅顺序变化 {s['reordered']} · 未变化 {s['unchanged']}</p>
+<p><a href='{export_url}'>导出差异 JSON（UTF-8）</a> ·
+<a href='/projects/{pid}/history'>历史版本</a> ·
+<a href='/projects/{pid}'>返回编辑</a></p>
+{''.join(sections)}"""
+    return layout(f"{proj['name']} · v{a}→v{b} 差异", body)
 
 
 # ---------------- HTTP ----------------
@@ -447,6 +547,11 @@ class Handler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/projects/(\d+)/versions/(\d+)", path)
             if m and method == "GET":
                 return self._send(200, page_version(int(m.group(1)), int(m.group(2))))
+            m = re.fullmatch(r"/projects/(\d+)/diff", path)
+            if m and method == "GET":
+                return self._page_diff(int(m.group(1)), q)
+            if method == "GET" and path == "/api/diff":
+                return self._api_diff(q)
             m = re.fullmatch(r"/projects/(\d+)/export", path)
             if m and method == "GET":
                 return self._export(int(m.group(1)), q)
@@ -547,6 +652,44 @@ class Handler(BaseHTTPRequestHandler):
         body = subtitle.to_srt(entries) if fmt == "srt" else subtitle.to_vtt(entries)
         filename = f"{proj['name']}-v{version}.{fmt}"
         self._send(200, body.encode("utf-8"), "text/plain; charset=utf-8",
+                   {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"})
+
+    def _page_diff(self, pid: int, q):
+        proj = store.get_project(pid)
+        if proj is None:
+            return self._send(404, layout("未找到", "<h2>项目不存在</h2>"))
+        from_v, to_v = _int_param(q, "from"), _int_param(q, "to")
+        if from_v is None or to_v is None:
+            return self._json(400, {"message": "需要 from 与 to 两个整数版本号参数"})
+        result = store.diff(pid, from_v, pid, to_v)
+        if result["status"] != "ok":
+            code = 404 if str(result.get("error", "")).endswith("not_found") else 400
+            return self._send(code, layout(
+                "无法对比",
+                f"<h2>无法对比</h2><p>{h(result['message'])}</p>"
+                f"<p><a href='/projects/{pid}/history'>返回历史版本</a></p>"))
+        return self._send(200, page_diff(proj, result))
+
+    def _api_diff(self, q):
+        params = {}
+        for key in ("from_project", "from_version", "to_project", "to_version"):
+            value = _int_param(q, key)
+            if value is None:
+                return self._json(400, {
+                    "status": "error",
+                    "message": "需要整数参数 from_project、from_version、"
+                               "to_project、to_version",
+                })
+            params[key] = value
+        result = store.diff(params["from_project"], params["from_version"],
+                            params["to_project"], params["to_version"])
+        if result["status"] != "ok":
+            code = 404 if str(result.get("error", "")).endswith("not_found") else 400
+            return self._json(code, result)
+        filename = (f"{result['project']['name']}"
+                    f"-v{result['from_version']}-v{result['to_version']}-diff.json")
+        body = json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")
+        self._send(200, body, "application/json; charset=utf-8",
                    {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"})
 
 

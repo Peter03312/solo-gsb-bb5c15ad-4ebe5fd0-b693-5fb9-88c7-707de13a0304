@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY app.py subtitle.py store.py ./
+COPY app.py subtitle.py store.py diff.py ./
 
 ENV HOST=0.0.0.0 \
     PORT=8000 \

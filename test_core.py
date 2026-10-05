@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 
+import diff
 import subtitle
 from store import Store
 
@@ -208,6 +209,118 @@ class MergeTests(unittest.TestCase):
             {"type": "update", "uid": self.u1, "text": "一样的修改",
              "start_ms": 1000, "end_ms": 2000}])
         self.assertEqual(r["status"], "merged")
+
+
+class DiffTests(unittest.TestCase):
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(self.db)
+        self.store = Store(self.db)
+        self.pid = self.store.create_project("测试", "srt", subtitle.parse_srt(SRT))
+        _, entries = self.store.head(self.pid)
+        self.u1, self.u2, self.u3 = [e["uid"] for e in entries]
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_identical_versions(self):
+        r = self.store.diff(self.pid, 1, self.pid, 1)
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["project"]["name"], "测试")  # 导出需含项目名
+        self.assertEqual(r["from_version"], 1)          # 导出需含双方版本号
+        self.assertEqual(r["to_version"], 1)
+        self.assertEqual(r["summary"], {"added": 0, "removed": 0, "changed": 0,
+                                        "reordered": 0, "unchanged": 3})
+
+    def test_add_remove_change(self):
+        self.store.merge(self.pid, 1, [
+            {"type": "update", "uid": self.u1, "text": "甲改",
+             "start_ms": 1000, "end_ms": 2000},
+            {"type": "delete", "uid": self.u2},
+            {"type": "insert", "after_uid": self.u3,
+             "start_ms": 7000, "end_ms": 8000, "text": "丁"},
+        ])
+        r = self.store.diff(self.pid, 1, self.pid, 2)
+        self.assertEqual(r["status"], "ok")
+        # 内容变化：双方时间与文本都在
+        self.assertEqual(len(r["changed"]), 1)
+        c = r["changed"][0]
+        self.assertEqual(c["uid"], self.u1)
+        self.assertEqual(c["before"]["text"], "甲")
+        self.assertEqual(c["after"]["text"], "甲改")
+        self.assertEqual((c["before"]["start_ms"], c["before"]["end_ms"]), (1000, 2000))
+        self.assertEqual((c["after"]["start_ms"], c["after"]["end_ms"]), (1000, 2000))
+        self.assertTrue(c["text_changed"])
+        self.assertFalse(c["time_changed"])
+        # 删除：保留旧侧时间与文本
+        self.assertEqual([e["uid"] for e in r["removed"]], [self.u2])
+        self.assertEqual(r["removed"][0]["text"], "乙")
+        self.assertEqual(r["removed"][0]["old_index"], 2)
+        # 新增：新侧时间与文本
+        self.assertEqual(len(r["added"]), 1)
+        self.assertEqual(r["added"][0]["text"], "丁")
+        self.assertEqual(r["added"][0]["new_index"], 3)
+        self.assertEqual(r["reordered"], [])
+        self.assertEqual(r["summary"]["unchanged"], 1)
+
+    def test_time_change(self):
+        self.store.merge(self.pid, 1, [
+            {"type": "update", "uid": self.u3, "text": "丙",
+             "start_ms": 5000, "end_ms": 6500}])
+        r = self.store.diff(self.pid, 1, self.pid, 2)
+        self.assertEqual(len(r["changed"]), 1)
+        c = r["changed"][0]
+        self.assertTrue(c["time_changed"])
+        self.assertFalse(c["text_changed"])
+        self.assertEqual(c["before"]["end_ms"], 6000)
+        self.assertEqual(c["after"]["end_ms"], 6500)
+        self.assertEqual(c["after"]["end"], "00:00:06,500")  # 附带格式化时间
+
+    def test_reorder_only_not_reported_as_change(self):
+        old = [
+            {"uid": "a", "start_ms": 0, "end_ms": 1000, "text": "一"},
+            {"uid": "b", "start_ms": 1000, "end_ms": 2000, "text": "二"},
+            {"uid": "c", "start_ms": 2000, "end_ms": 3000, "text": "三"},
+        ]
+        new = [old[1], old[0], old[2]]  # 仅交换前两条顺序
+        r = diff.diff_entries(old, new)
+        self.assertEqual(r["changed"], [])   # 不得误报为内容修改
+        self.assertEqual(r["added"], [])
+        self.assertEqual(r["removed"], [])
+        self.assertEqual(len(r["reordered"]), 1)
+        moved = r["reordered"][0]
+        self.assertEqual(moved["uid"], "a")
+        self.assertEqual((moved["from_index"], moved["to_index"]), (1, 2))
+        self.assertEqual(moved["text"], "一")
+        self.assertEqual(r["summary"]["unchanged"], 2)
+
+    def test_reverse_direction(self):
+        self.store.merge(self.pid, 1, [
+            {"type": "update", "uid": self.u1, "text": "甲改",
+             "start_ms": 1000, "end_ms": 2000}])
+        r = self.store.diff(self.pid, 2, self.pid, 1)  # 反向对比同样成立
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["changed"][0]["before"]["text"], "甲改")
+        self.assertEqual(r["changed"][0]["after"]["text"], "甲")
+
+    def test_version_not_found(self):
+        r = self.store.diff(self.pid, 1, self.pid, 99)
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["error"], "version_not_found")
+        self.assertIn("v99", r["message"])
+
+    def test_project_not_found(self):
+        r = self.store.diff(999, 1, 999, 2)
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["error"], "project_not_found")
+
+    def test_different_projects_rejected(self):
+        pid2 = self.store.create_project("另一个", "srt", subtitle.parse_srt(SRT))
+        r = self.store.diff(self.pid, 1, pid2, 1)
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["error"], "different_projects")
+        self.assertIn("不同项目", r["message"])
 
 
 if __name__ == "__main__":
