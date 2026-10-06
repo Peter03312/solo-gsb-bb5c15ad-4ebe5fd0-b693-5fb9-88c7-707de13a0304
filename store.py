@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime
 
 from subtitle import validate_track
+from diff import diff_entries
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -138,6 +139,51 @@ class Store:
         ).fetchone()
         number = row["n"] or 0
         return number, (self._snapshot(conn, pid, number) if number else [])
+
+    def diff_versions(self, pid_a: int, number_a: int,
+                      pid_b: int | None = None, number_b: int | None = None) -> dict:
+        """对比同一项目的两个版本快照。
+
+        pid_b/number_b 默认同项目（历史页只在一个项目内选两个版本）；
+        显式传入另一项目 id 时会做跨项目校验。版本不存在或属于不同项目时
+        返回 {"status": "error", "message": ...}，否则返回 {"status": "ok", ...}。
+        """
+        if pid_b is None:
+            pid_b = pid_a
+        with self._connect() as conn:
+            proj_a = conn.execute(
+                "SELECT id, name FROM projects WHERE id = ?", (pid_a,)
+            ).fetchone()
+            proj_b = proj_a if pid_b == pid_a else conn.execute(
+                "SELECT id, name FROM projects WHERE id = ?", (pid_b,)
+            ).fetchone()
+            if proj_a is None or proj_b is None:
+                missing = pid_a if proj_a is None else pid_b
+                return {"status": "error", "message": f"项目 {missing} 不存在"}
+            if proj_b["id"] != proj_a["id"]:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"拒绝比对：版本分属不同项目（项目 {proj_a['id']}「{proj_a['name']}」"
+                        f"与项目 {proj_b['id']}「{proj_b['name']}」），仅支持同一项目内版本对比"
+                    ),
+                }
+            snap_a = self._snapshot(conn, proj_a["id"], number_a)
+            if snap_a is None:
+                return {"status": "error",
+                        "message": f"版本 v{number_a} 在项目「{proj_a['name']}」中不存在"}
+            snap_b = self._snapshot(conn, proj_b["id"], number_b)
+            if snap_b is None:
+                return {"status": "error",
+                        "message": f"版本 v{number_b} 在项目「{proj_a['name']}」中不存在"}
+            result = diff_entries(snap_a, snap_b)
+            result.update({
+                "status": "ok",
+                "project": {"id": proj_a["id"], "name": proj_a["name"]},
+                "version_a": number_a,
+                "version_b": number_b,
+            })
+            return result
 
     # ---------- 写入 ----------
 
